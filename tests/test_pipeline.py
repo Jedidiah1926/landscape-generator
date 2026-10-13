@@ -174,3 +174,56 @@ def test_prepare_image_downscales():
     import base64, io
     img = Image.open(io.BytesIO(base64.b64decode(data)))
     assert media == "image/png" and max(img.size) == ai_analyzer.MAX_IMAGE_EDGE
+
+
+# ------------------------------------------------------------------ 절차적 지형
+from terrain.procedural import (PRESETS, GradientNoise, ProceduralSettings, apply_procedural,  # noqa: E402
+                                hydraulic_erosion, noise_field, thermal_erosion)
+from terrain.render import hillshade_png  # noqa: E402
+
+
+def test_noise_is_deterministic_and_bounded():
+    a = noise_field((40, 60), ProceduralSettings(seed=7))
+    b = noise_field((40, 60), ProceduralSettings(seed=7))
+    c = noise_field((40, 60), ProceduralSettings(seed=8))
+    assert np.array_equal(a, b) and not np.array_equal(a, c)
+    assert abs(a.mean()) < 1e-9 and np.abs(a).max() <= 2.0
+    n = GradientNoise(1)
+    assert np.allclose(n(np.arange(5.0), np.zeros(5)), 0)  # 격자점에서 Perlin 노이즈는 0
+
+
+@pytest.mark.parametrize("name", list(PRESETS))
+def test_presets_keep_base_shape(name):
+    base = build_heightmap(hill_analysis(), 60, 40)
+    z = apply_procedural(base, PRESETS[name])
+    assert z.shape == base.shape and np.isfinite(z).all()
+    assert not np.allclose(z, base)
+    # 밑그림의 큰 형태(가운데 봉우리)는 유지
+    assert np.corrcoef(z.ravel(), base.ravel())[0, 1] > 0.9
+    peak = np.unravel_index(np.argmax(z), z.shape)
+    assert abs(peak[0] - 20) <= 8 and abs(peak[1] - 30) <= 10
+
+
+def test_procedural_disabled_settings_is_identity():
+    base = build_heightmap(hill_analysis(), 30, 30)
+    s = ProceduralSettings(detail=0, hydraulic=0, thermal=0)
+    assert np.allclose(apply_procedural(base, s), base)
+
+
+def test_hydraulic_erosion_only_lowers_and_carves():
+    y, x = np.mgrid[0:50, 0:50]
+    z = 1 - np.hypot(x - 25, y - 25) / 40 + 0.02 * noise_field((50, 50), ProceduralSettings())
+    eroded = hydraulic_erosion(z, 20, 1.0)
+    assert (eroded <= z + 1e-12).all() and (z - eroded).max() > 0.01
+
+
+def test_thermal_erosion_conserves_mass_and_reduces_steepness():
+    z = np.zeros((30, 30))
+    z[10:20, 10:20] = 1.0
+    out = thermal_erosion(z, 30, talus=0.5)
+    assert out.sum() == pytest.approx(z.sum())
+    assert np.abs(np.diff(out, axis=0)).max() < 1.0
+
+
+def test_hillshade_png():
+    assert hillshade_png(build_heightmap(hill_analysis(), 20, 20)).startswith(b"\x89PNG")

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+from dataclasses import replace
 
 import streamlit as st
 from PIL import Image
@@ -15,7 +17,8 @@ from terrain.ai_analyzer import AnalysisError, TerrainAnalysis, analyze_map
 from terrain.providers import PROVIDERS, ProviderError
 from terrain.export import heightmap_png, obj_bytes, stl_bytes
 from terrain.heightmap import build_heightmap, resolution_for
-from terrain.render import contour_figure, contour_levels, surface_figure
+from terrain.procedural import PRESETS, ProceduralSettings, apply_procedural
+from terrain.render import contour_figure, contour_levels, hillshade_png, surface_figure
 
 st.set_page_config(page_title="지도 → 3D 지형 생성기", page_icon="🏔️", layout="wide")
 
@@ -50,6 +53,47 @@ with st.sidebar:
     detail = st.slider("이미지 질감 반영", 0.0, 0.3, 0.0, step=0.01,
                        help="음영 기복도/위성사진에서 원본 밝기의 미세 기복을 더합니다.")
     exaggeration = st.slider("3D 높이 과장", 0.2, 5.0, 1.0, step=0.1)
+
+    st.header("🌄 절차적 지형")
+    use_procedural = st.toggle(
+        "AI 밑그림 위에 절차적 지형 생성", value=True,
+        help="AI가 읽은 고도를 밑그림으로 삼고, 노이즈 디테일과 침식 시뮬레이션으로 자연스러운 지형을 만듭니다.",
+    )
+    procedural: ProceduralSettings | None = None
+    if use_procedural:
+        preset_name = st.selectbox("스타일", list(PRESETS))
+        preset = PRESETS[preset_name]
+        if "seed" not in st.session_state:
+            st.session_state["seed"] = 0
+        sc1, sc2 = st.columns([3, 2])
+        sc1.number_input("시드", 0, 999_999, key="seed")
+        sc2.button("🎲 랜덤", use_container_width=True,
+                   on_click=lambda: st.session_state.update(seed=random.randint(0, 999_999)))
+        with st.expander("세부 설정"):
+            k = preset_name  # 스타일을 바꾸면 슬라이더가 그 프리셋 값으로 초기화되도록 key에 포함
+            procedural = replace(
+                preset,
+                seed=int(st.session_state["seed"]),
+                detail=st.slider("디테일 강도", 0.0, 0.4, preset.detail, 0.01, key=f"detail_{k}",
+                                 help="밑그림 고도 범위 대비 노이즈 진폭"),
+                feature_size=st.slider("지형 특징 크기", 0.03, 1.0, preset.feature_size, 0.01, key=f"fs_{k}",
+                                       help="작을수록 잘고 촘촘한 기복"),
+                octaves=st.slider("옥타브 (세밀함)", 1, 8, preset.octaves, key=f"oct_{k}"),
+                ridged=st.slider("산 능선 (ridged)", 0.0, 1.0, preset.ridged, 0.05, key=f"ridge_{k}",
+                                 help="0 = 둥근 언덕, 1 = 날카로운 능선"),
+                warp=st.slider("도메인 왜곡", 0.0, 1.5, preset.warp, 0.05, key=f"warp_{k}",
+                               help="지형을 소용돌이치듯 휘게 만듭니다"),
+                height_mask=st.slider("높은 곳일수록 거칠게", 0.0, 1.0, preset.height_mask, 0.05, key=f"mask_{k}"),
+                hydraulic=st.slider("수력 침식 (반복)", 0, 100, preset.hydraulic, key=f"hyd_{k}",
+                                    help="빗물이 흐르며 계곡을 파냅니다. 클수록 느려집니다."),
+                erosion_strength=st.slider("수력 침식 강도", 0.0, 2.0, preset.erosion_strength, 0.05,
+                                           key=f"eros_{k}"),
+                thermal=st.slider("열 침식 (반복)", 0, 60, preset.thermal, key=f"th_{k}",
+                                  help="가파른 경사가 무너져 부드러워집니다."),
+                talus=st.slider("열 침식 임계 경사", 0.1, 2.0, preset.talus, 0.05, key=f"talus_{k}"),
+            )
+        if procedural is None:
+            procedural = replace(preset, seed=int(st.session_state["seed"]))
 
 st.title("🏔️ 지도 → 등고선 / 3D 지형 생성기")
 st.caption("지도 이미지를 올리면 AI(Claude / GPT / Gemini)가 스캔해 고도를 읽고, 등고선 지도와 3D 지형을 만들어 줍니다.")
@@ -106,7 +150,19 @@ if analysis.notes:
     st.caption(f"참고: {analysis.notes}")
 
 width, height = resolution_for(image, resolution)
-z = build_heightmap(analysis, width, height, smoothing=smoothing, image=image, detail=detail)
+base_z = build_heightmap(analysis, width, height, smoothing=smoothing, image=image, detail=detail)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _procedural(base, settings: ProceduralSettings):
+    return apply_procedural(base, settings)
+
+
+if procedural is not None:
+    with st.spinner("절차적 지형 생성 중 (노이즈 + 침식 시뮬레이션)..."):
+        z = _procedural(base_z, procedural)
+else:
+    z = base_z
 
 levels = contour_levels(z, analysis.contour_interval)
 default_interval = float(levels[1] - levels[0]) if len(levels) > 1 else 10.0
@@ -115,7 +171,9 @@ interval = st.number_input(
     help="0이면 자동으로 정합니다.",
 )
 
-tab3d, tab_contour, tab_overlay, tab_export = st.tabs(["🗻 3D 지형", "🗺️ 등고선 지도", "🔎 원본 위 등고선", "💾 내보내기"])
+tab3d, tab_contour, tab_overlay, tab_compare, tab_export = st.tabs(
+    ["🗻 3D 지형", "🗺️ 등고선 지도", "🔎 원본 위 등고선", "🌄 밑그림 비교", "💾 내보내기"]
+)
 
 with tab3d:
     textured = st.toggle("원본 지도를 지형 표면에 입히기", value=False)
@@ -132,6 +190,15 @@ with tab_overlay:
     show_points = st.toggle("AI가 찍은 제어점 표시", value=True)
     st.image(contour_figure(z, analysis, interval, background=image, show_points=show_points),
              use_container_width=True)
+
+with tab_compare:
+    if procedural is None:
+        st.info("사이드바에서 '절차적 지형 생성'을 켜면 AI 밑그림과 결과를 비교할 수 있습니다.")
+    else:
+        lo, hi = float(min(base_z.min(), z.min())), float(max(base_z.max(), z.max()))
+        b1, b2 = st.columns(2)
+        b1.image(hillshade_png(base_z, lo, hi), caption="AI 밑그림", use_container_width=True)
+        b2.image(hillshade_png(z, lo, hi), caption="절차적 지형 결과", use_container_width=True)
 
 with tab_export:
     st.write("3D 프린팅·Blender·게임 엔진에서 사용할 수 있는 파일로 내보냅니다.")
