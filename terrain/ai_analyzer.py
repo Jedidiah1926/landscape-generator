@@ -1,4 +1,4 @@
-"""Claude 비전으로 지도 이미지를 스캔해 고도 정보를 구조화된 JSON으로 추출한다."""
+"""AI 비전(Claude / GPT / Gemini)으로 지도 이미지를 스캔해 고도 정보를 구조화된 JSON으로 추출한다."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import io
 import json
 from dataclasses import dataclass, field
 
-import anthropic
 from PIL import Image
 
-MODEL = "claude-opus-5-5"
+from .providers import PROVIDERS, ProviderError
+
 MAX_IMAGE_EDGE = 1568  # 비전 입력 권장 최대 변 길이
 
 SYSTEM_PROMPT = """\
@@ -80,7 +80,10 @@ SCHEMA = {
 
 
 class AnalysisError(RuntimeError):
-    """AI 분석 실패(거절, 잘림, 파싱 오류 등)."""
+    """AI 응답을 고도 데이터로 해석하지 못함."""
+
+
+__all__ = ["AnalysisError", "ProviderError", "TerrainAnalysis", "analyze_map", "prepare_image"]
 
 
 @dataclass
@@ -154,45 +157,36 @@ def prepare_image(image: Image.Image) -> tuple[str, str]:
     return "image/png", base64.standard_b64encode(buf.getvalue()).decode("ascii")
 
 
-def analyze_map(image: Image.Image, api_key: str, hint: str = "", effort: str = "high") -> TerrainAnalysis:
-    """지도 이미지를 Claude에 보내 고도 분석 결과를 받는다. API 키는 필수."""
+def analyze_map(
+    image: Image.Image,
+    api_key: str,
+    hint: str = "",
+    effort: str = "high",
+    provider: str = "anthropic",
+    model: str | None = None,
+) -> TerrainAnalysis:
+    """지도 이미지를 선택한 AI 제공자에 보내 고도 분석 결과를 받는다. API 키는 필수."""
     if not api_key or not api_key.strip():
-        raise ValueError("Anthropic API 키가 필요합니다.")
+        raise ValueError("API 키가 필요합니다.")
+    if provider not in PROVIDERS:
+        raise ValueError(f"지원하지 않는 제공자입니다: {provider}")
+    spec = PROVIDERS[provider]
 
     media_type, data = prepare_image(image)
     user_text = "Analyze this map and estimate its terrain elevation."
     if hint.strip():
         user_text += f"\n\nExtra information from the user about this map:\n{hint.strip()}"
 
-    client = anthropic.Anthropic(api_key=api_key.strip())
-    # 응답이 길 수 있으므로 스트리밍으로 받아 HTTP 타임아웃을 피한다.
-    with client.beta.messages.stream(
-        model=MODEL,
-        max_tokens=64000,
+    text = spec.call(
+        api_key=api_key.strip(),
+        model=(model or "").strip() or spec.default_model,
         system=SYSTEM_PROMPT,
-        thinking={"type": "adaptive"},
-        output_config={"effort": effort, "format": {"type": "json_schema", "schema": SCHEMA}},
-        # 안전 분류기가 거절하면 서버가 권장 모델로 자동 재시도
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}},
-                {"type": "text", "text": user_text},
-            ],
-        }],
-    ) as stream:
-        response = stream.get_final_message()
-
-    if response.stop_reason == "refusal":
-        raise AnalysisError("모델이 이 이미지 분석을 거절했습니다.")
-    if response.stop_reason == "max_tokens":
-        raise AnalysisError("응답이 너무 길어 잘렸습니다. 더 작은 영역의 지도로 다시 시도하세요.")
-
-    text = next((b.text for b in response.content if b.type == "text"), None)
-    if text is None:
-        raise AnalysisError("모델 응답에 결과가 없습니다.")
+        user_text=user_text,
+        media_type=media_type,
+        image_b64=data,
+        schema=SCHEMA,
+        effort=effort,
+    )
     try:
         result = TerrainAnalysis.from_dict(json.loads(text))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:

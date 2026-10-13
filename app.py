@@ -1,4 +1,4 @@
-"""지도 → 등고선 / 3D 지형 생성기 (Streamlit 앱).
+"""지도 → 등고선 / 3D 지형 생성기 (Streamlit 앱). Anthropic / OpenAI / Google 지원.
 
 실행:  streamlit run app.py
 """
@@ -8,11 +8,11 @@ from __future__ import annotations
 import json
 import os
 
-import anthropic
 import streamlit as st
 from PIL import Image
 
 from terrain.ai_analyzer import AnalysisError, TerrainAnalysis, analyze_map
+from terrain.providers import PROVIDERS, ProviderError
 from terrain.export import heightmap_png, obj_bytes, stl_bytes
 from terrain.heightmap import build_heightmap, resolution_for
 from terrain.render import contour_figure, contour_levels, surface_figure
@@ -21,17 +21,27 @@ st.set_page_config(page_title="지도 → 3D 지형 생성기", page_icon="🏔�
 
 # ---------------------------------------------------------------- 사이드바
 with st.sidebar:
-    st.header("🔑 API 키")
+    st.header("🤖 AI 제공자")
+    provider_key = st.radio(
+        "사용할 AI", list(PROVIDERS), format_func=lambda k: PROVIDERS[k].label,
+        help="세 곳 중 API 키가 있는 곳을 고르세요.",
+    )
+    provider = PROVIDERS[provider_key]
     api_key = st.text_input(
-        "Anthropic API 키",
+        f"{provider.label} API 키",
         type="password",
-        value=os.environ.get("ANTHROPIC_API_KEY", ""),
-        placeholder="sk-ant-...",
-        help="https://console.anthropic.com 에서 발급. 키는 이 세션에서만 사용되고 저장되지 않습니다.",
+        value=os.environ.get(provider.env_var, ""),
+        placeholder=provider.key_placeholder,
+        key=f"api_key_{provider_key}",
+        help=f"{provider.key_url} 에서 발급. 키는 이 세션에서만 사용되고 저장되지 않습니다.",
+    )
+    model = st.text_input(
+        "모델", value=provider.default_model, key=f"model_{provider_key}",
+        help="비전(이미지 입력)과 JSON 스키마 출력을 지원하는 모델이어야 합니다.",
     )
     effort = st.select_slider(
         "분석 정밀도 (effort)", options=["low", "medium", "high", "xhigh"], value="high",
-        help="높을수록 정확하지만 느리고 비용이 큽니다.",
+        help="높을수록 정확하지만 느리고 비용이 큽니다. (Gemini에서는 무시됩니다)",
     )
 
     st.header("⚙️ 지형 설정")
@@ -42,7 +52,7 @@ with st.sidebar:
     exaggeration = st.slider("3D 높이 과장", 0.2, 5.0, 1.0, step=0.1)
 
 st.title("🏔️ 지도 → 등고선 / 3D 지형 생성기")
-st.caption("지도 이미지를 올리면 Claude AI가 스캔해 고도를 읽고, 등고선 지도와 3D 지형을 만들어 줍니다.")
+st.caption("지도 이미지를 올리면 AI(Claude / GPT / Gemini)가 스캔해 고도를 읽고, 등고선 지도와 3D 지형을 만들어 줍니다.")
 
 uploaded = st.file_uploader("지도 이미지 업로드 (PNG, JPG, WEBP)", type=["png", "jpg", "jpeg", "webp"])
 hint = st.text_area(
@@ -71,18 +81,12 @@ with col_btn:
         st.warning("사이드바에 API 키를 입력해야 스캔할 수 있습니다.")
 
 if run:
-    with st.spinner("Claude가 지도를 분석하는 중... (최대 몇 분 걸릴 수 있습니다)"):
+    with st.spinner(f"{provider.label}가 지도를 분석하는 중... (최대 몇 분 걸릴 수 있습니다)"):
         try:
-            st.session_state["analysis"] = analyze_map(image, api_key, hint, effort).to_dict()
-        except anthropic.AuthenticationError:
-            st.error("API 키가 올바르지 않습니다.")
-        except anthropic.RateLimitError:
-            st.error("요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.")
-        except anthropic.APIStatusError as exc:
-            st.error(f"API 오류 ({exc.status_code}): {exc.message}")
-        except anthropic.APIConnectionError:
-            st.error("Anthropic API에 연결할 수 없습니다. 네트워크를 확인하세요.")
-        except AnalysisError as exc:
+            st.session_state["analysis"] = analyze_map(
+                image, api_key, hint, effort, provider=provider_key, model=model,
+            ).to_dict()
+        except (ProviderError, AnalysisError) as exc:
             st.error(str(exc))
 
 if "analysis" not in st.session_state:
