@@ -116,3 +116,19 @@ def surface_figure(
         },
     )
     return fig
+
+
+def hillshade_png(z: np.ndarray, vmin: float | None = None, vmax: float | None = None) -> bytes:
+    """음영 기복도(hillshade) PNG. 밑그림과 결과 비교용."""
+    from matplotlib.colors import LightSource, Normalize
+
+    h, w = z.shape
+    lo = float(z.min()) if vmin is None else vmin
+    hi = float(z.max()) if vmax is None else vmax
+    rgb = LightSource(azdeg=315, altdeg=45).shade(
+        z, cmap=plt.cm.terrain, norm=Normalize(lo, hi), vert_exag=0.15 * max(h, w) / ((hi - lo) or 1.0),
+        blend_mode="overlay",
+    )
+    buf = io.BytesIO()
+    Image.fromarray((rgb[..., :3] * 255).astype(np.uint8)).save(buf, format="PNG")
+    return buf.getvalue()

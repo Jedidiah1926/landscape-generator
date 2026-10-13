@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 from terrain import ai_analyzer
-from terrain.ai_analyzer import AnalysisError, TerrainAnalysis, analyze_map
+from terrain.ai_analyzer import AnalysisError, ProviderError, TerrainAnalysis, analyze_map
 from terrain.export import heightmap_png, obj_bytes, stl_bytes
 from terrain.heightmap import build_heightmap
 from terrain.render import contour_figure, contour_levels, surface_figure
@@ -74,9 +74,13 @@ def test_analyze_map_requires_key():
         analyze_map(Image.new("RGB", (10, 10)), "  ")
 
 
-def _fake_client(stop_reason="end_turn", text=None):
-    payload = text if text is not None else json.dumps(hill_analysis().to_dict())
-    message = SimpleNamespace(stop_reason=stop_reason, content=[SimpleNamespace(type="text", text=payload)])
+def _payload():
+    return json.dumps(hill_analysis().to_dict())
+
+
+def _fake_anthropic(stop_reason="end_turn", text=None):
+    message = SimpleNamespace(stop_reason=stop_reason,
+                              content=[SimpleNamespace(type="text", text=text if text is not None else _payload())])
     stream = mock.MagicMock()
     stream.__enter__.return_value.get_final_message.return_value = message
     client = mock.MagicMock()
@@ -84,9 +88,32 @@ def _fake_client(stop_reason="end_turn", text=None):
     return client
 
 
-def test_analyze_map_parses_response():
-    client = _fake_client()
-    with mock.patch.object(ai_analyzer.anthropic, "Anthropic", return_value=client) as ctor:
+def _fake_openai(status="completed", text=None, reason=None):
+    response = SimpleNamespace(status=status, output_text=text if text is not None else _payload(),
+                               incomplete_details=SimpleNamespace(reason=reason), output=[])
+    client = mock.MagicMock()
+    client.responses.create.return_value = response
+    return client
+
+
+def _fake_google(finish="STOP", text=None):
+    response = SimpleNamespace(text=text if text is not None else _payload(), prompt_feedback=None,
+                               candidates=[SimpleNamespace(finish_reason=finish)])
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = response
+    return client
+
+
+def _patch(provider, client):
+    import anthropic, openai
+    from google import genai
+    target = {"anthropic": (anthropic, "Anthropic"), "openai": (openai, "OpenAI"), "google": (genai, "Client")}[provider]
+    return mock.patch.object(*target, return_value=client)
+
+
+def test_analyze_map_anthropic():
+    client = _fake_anthropic()
+    with _patch("anthropic", client) as ctor:
         result = analyze_map(Image.new("RGB", (3000, 1500)), "sk-test", hint="10m interval")
     ctor.assert_called_once_with(api_key="sk-test")
     kwargs = client.beta.messages.stream.call_args.kwargs
@@ -96,11 +123,50 @@ def test_analyze_map_parses_response():
     assert result.max_elevation == 500 and len(result.control_points) == 49
 
 
-@pytest.mark.parametrize("stop_reason,text", [("refusal", None), ("max_tokens", None), ("end_turn", "not json")])
-def test_analyze_map_errors(stop_reason, text):
-    with mock.patch.object(ai_analyzer.anthropic, "Anthropic", return_value=_fake_client(stop_reason, text)):
-        with pytest.raises(AnalysisError):
-            analyze_map(Image.new("RGB", (10, 10)), "sk-test")
+def test_analyze_map_openai():
+    client = _fake_openai()
+    with _patch("openai", client) as ctor:
+        result = analyze_map(Image.new("RGB", (100, 100)), "sk-oa", effort="xhigh", provider="openai", model="gpt-x")
+    ctor.assert_called_once_with(api_key="sk-oa")
+    kwargs = client.responses.create.call_args.kwargs
+    assert kwargs["model"] == "gpt-x"
+    assert kwargs["reasoning"] == {"effort": "high"}
+    assert kwargs["text"]["format"]["strict"] is True
+    assert kwargs["input"][0]["content"][0]["image_url"].startswith("data:image/png;base64,")
+    assert result.max_elevation == 500
+
+
+def test_analyze_map_google():
+    client = _fake_google()
+    with _patch("google", client) as ctor:
+        result = analyze_map(Image.new("RGB", (100, 100)), "AIza-test", provider="google")
+    ctor.assert_called_once_with(api_key="AIza-test")
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs["model"] == ai_analyzer.PROVIDERS["google"].default_model
+    assert kwargs["config"].response_mime_type == "application/json"
+    assert result.max_elevation == 500
+
+
+@pytest.mark.parametrize("provider,client,exc", [
+    ("anthropic", lambda: _fake_anthropic("refusal"), ProviderError),
+    ("anthropic", lambda: _fake_anthropic("max_tokens"), ProviderError),
+    ("anthropic", lambda: _fake_anthropic(text="not json"), AnalysisError),
+    ("openai", lambda: _fake_openai("incomplete", reason="max_output_tokens"), ProviderError),
+    ("openai", lambda: _fake_openai("incomplete", reason="content_filter"), ProviderError),
+    ("openai", lambda: _fake_openai(text="{}"), AnalysisError),
+    ("google", lambda: _fake_google("FinishReason.MAX_TOKENS"), ProviderError),
+    ("google", lambda: _fake_google("FinishReason.SAFETY"), ProviderError),
+    ("google", lambda: _fake_google(text="[oops"), AnalysisError),
+])
+def test_analyze_map_errors(provider, client, exc):
+    with _patch(provider, client()):
+        with pytest.raises(exc):
+            analyze_map(Image.new("RGB", (10, 10)), "key", provider=provider)
+
+
+def test_unknown_provider():
+    with pytest.raises(ValueError):
+        analyze_map(Image.new("RGB", (10, 10)), "key", provider="nope")
 
 
 def test_prepare_image_downscales():
@@ -108,3 +174,56 @@ def test_prepare_image_downscales():
     import base64, io
     img = Image.open(io.BytesIO(base64.b64decode(data)))
     assert media == "image/png" and max(img.size) == ai_analyzer.MAX_IMAGE_EDGE
+
+
+# ------------------------------------------------------------------ 절차적 지형
+from terrain.procedural import (PRESETS, GradientNoise, ProceduralSettings, apply_procedural,  # noqa: E402
+                                hydraulic_erosion, noise_field, thermal_erosion)
+from terrain.render import hillshade_png  # noqa: E402
+
+
+def test_noise_is_deterministic_and_bounded():
+    a = noise_field((40, 60), ProceduralSettings(seed=7))
+    b = noise_field((40, 60), ProceduralSettings(seed=7))
+    c = noise_field((40, 60), ProceduralSettings(seed=8))
+    assert np.array_equal(a, b) and not np.array_equal(a, c)
+    assert abs(a.mean()) < 1e-9 and np.abs(a).max() <= 2.0
+    n = GradientNoise(1)
+    assert np.allclose(n(np.arange(5.0), np.zeros(5)), 0)  # 격자점에서 Perlin 노이즈는 0
+
+
+@pytest.mark.parametrize("name", list(PRESETS))
+def test_presets_keep_base_shape(name):
+    base = build_heightmap(hill_analysis(), 60, 40)
+    z = apply_procedural(base, PRESETS[name])
+    assert z.shape == base.shape and np.isfinite(z).all()
+    assert not np.allclose(z, base)
+    # 밑그림의 큰 형태(가운데 봉우리)는 유지
+    assert np.corrcoef(z.ravel(), base.ravel())[0, 1] > 0.9
+    peak = np.unravel_index(np.argmax(z), z.shape)
+    assert abs(peak[0] - 20) <= 8 and abs(peak[1] - 30) <= 10
+
+
+def test_procedural_disabled_settings_is_identity():
+    base = build_heightmap(hill_analysis(), 30, 30)
+    s = ProceduralSettings(detail=0, hydraulic=0, thermal=0)
+    assert np.allclose(apply_procedural(base, s), base)
+
+
+def test_hydraulic_erosion_only_lowers_and_carves():
+    y, x = np.mgrid[0:50, 0:50]
+    z = 1 - np.hypot(x - 25, y - 25) / 40 + 0.02 * noise_field((50, 50), ProceduralSettings())
+    eroded = hydraulic_erosion(z, 20, 1.0)
+    assert (eroded <= z + 1e-12).all() and (z - eroded).max() > 0.01
+
+
+def test_thermal_erosion_conserves_mass_and_reduces_steepness():
+    z = np.zeros((30, 30))
+    z[10:20, 10:20] = 1.0
+    out = thermal_erosion(z, 30, talus=0.5)
+    assert out.sum() == pytest.approx(z.sum())
+    assert np.abs(np.diff(out, axis=0)).max() < 1.0
+
+
+def test_hillshade_png():
+    assert hillshade_png(build_heightmap(hill_analysis(), 20, 20)).startswith(b"\x89PNG")
