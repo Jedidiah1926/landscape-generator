@@ -58,7 +58,11 @@ def _call_anthropic(*, api_key, model, system, user_text, media_type, image_b64,
     except anthropic.AuthenticationError as exc:
         raise ProviderError("auth", "API 키가 올바르지 않습니다.") from exc
     except anthropic.RateLimitError as exc:
-        raise ProviderError("rate_limit", "요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.") from exc
+        raise ProviderError(
+            "rate_limit",
+            "Anthropic 요청 한도를 초과했습니다. 잠시 후 다시 시도하거나, 콘솔(console.anthropic.com)에서 "
+            f"크레딧·사용 한도를 확인하세요.\n\n원본 메시지: {exc.message}",
+        ) from exc
     except anthropic.APIStatusError as exc:
         raise ProviderError("api", f"API 오류 ({exc.status_code}): {exc.message}") from exc
     except anthropic.APIConnectionError as exc:
@@ -97,7 +101,12 @@ def _call_openai(*, api_key, model, system, user_text, media_type, image_b64, sc
     except openai.AuthenticationError as exc:
         raise ProviderError("auth", "API 키가 올바르지 않습니다.") from exc
     except openai.RateLimitError as exc:
-        raise ProviderError("rate_limit", "요청 한도를 초과했거나 크레딧이 부족합니다.") from exc
+        if "insufficient_quota" in str(exc):
+            hint = ("OpenAI 계정에 크레딧이 없습니다. platform.openai.com → Billing에서 결제 수단을 등록하고 "
+                    "크레딧을 충전해야 합니다 (ChatGPT 구독과 API 요금은 별개입니다).")
+        else:
+            hint = "OpenAI 요청 한도를 초과했습니다. 잠시 후 다시 시도하세요."
+        raise ProviderError("rate_limit", f"{hint}\n\n원본 메시지: {exc.message}") from exc
     except openai.APIStatusError as exc:
         raise ProviderError("api", f"API 오류 ({exc.status_code}): {exc.message}") from exc
     except openai.APIConnectionError as exc:
@@ -139,9 +148,20 @@ def _call_google(*, api_key, model, system, user_text, media_type, image_b64, sc
         )
     except errors.APIError as exc:
         if exc.code in (401, 403) or "API_KEY_INVALID" in str(exc):
-            raise ProviderError("auth", "API 키가 올바르지 않습니다.") from exc
+            raise ProviderError(
+                "auth",
+                "API 키가 올바르지 않거나 거부되었습니다. AI Studio에서 새로 발급한 AQ. 형식 키라면 "
+                "키를 다시 확인하고, 계속 401이 나면 Google Cloud 콘솔에서 Gemini API용 키를 발급해 보세요.",
+            ) from exc
         if exc.code == 429:
-            raise ProviderError("rate_limit", "요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.") from exc
+            detail = str(exc)
+            if "limit: 0" in detail or "free_tier" in detail.lower():
+                hint = (f"`{model}` 모델은 무료 등급에서 사용할 수 없습니다(할당량 0). 사이드바의 모델을 "
+                        "Flash 계열(예: gemini-3-flash-preview)로 바꾸거나, AI Studio에서 결제를 연결하세요.")
+            else:
+                hint = ("Gemini 요청 한도를 초과했습니다. 무료 등급은 분당·일일 요청 수가 적으니 1분쯤 뒤 다시 "
+                        "시도하거나 Flash 계열 모델을 사용하세요.")
+            raise ProviderError("rate_limit", f"{hint}\n\n원본 메시지: {exc.message}") from exc
         raise ProviderError("api", f"API 오류 ({exc.code}): {exc.message}") from exc
     except OSError as exc:
         raise ProviderError("connection", "Google Gemini API에 연결할 수 없습니다.") from exc
@@ -168,6 +188,6 @@ PROVIDERS: dict[str, Provider] = {
         Provider("openai", "OpenAI (GPT)", "gpt-5.4", "OPENAI_API_KEY",
                  "sk-...", "https://platform.openai.com/api-keys", _call_openai),
         Provider("google", "Google (Gemini)", "gemini-3.1-pro-preview", "GEMINI_API_KEY",
-                 "AIza...", "https://aistudio.google.com/apikey", _call_google),
+                 "AQ.... (또는 예전 형식 AIza...)", "https://aistudio.google.com/apikey", _call_google),
     )
 }

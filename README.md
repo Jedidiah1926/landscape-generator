@@ -12,6 +12,8 @@
 | OpenAI (GPT) | `gpt-5.4` | [platform.openai.com](https://platform.openai.com/api-keys) | `OPENAI_API_KEY` |
 | Google (Gemini) | `gemini-3.1-pro-preview` | [aistudio.google.com](https://aistudio.google.com/apikey) | `GEMINI_API_KEY` |
 
+Gemini 키는 최근 AI Studio에서 `AQ.`로 시작하는 형식으로 발급됩니다(예전 키는 `AIza...`). 둘 다 그대로 넣으면 됩니다.
+
 모델 이름은 사이드바에서 바꿀 수 있습니다. 이미지 입력과 JSON 스키마 출력을 지원하는 모델이면 됩니다.
 
 ## 동작 방식
@@ -40,8 +42,11 @@
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
+python -m streamlit run app.py
 ```
+
+> Windows에서 `streamlit` 명령을 찾을 수 없다고 나오면 위처럼 `python -m streamlit`으로 실행하세요.
+> (pip가 `streamlit.exe`를 PATH에 없는 폴더에 설치했기 때문입니다.)
 
 브라우저가 열리면:
 

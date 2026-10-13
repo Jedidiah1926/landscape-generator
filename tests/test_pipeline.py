@@ -139,8 +139,8 @@ def test_analyze_map_openai():
 def test_analyze_map_google():
     client = _fake_google()
     with _patch("google", client) as ctor:
-        result = analyze_map(Image.new("RGB", (100, 100)), "AIza-test", provider="google")
-    ctor.assert_called_once_with(api_key="AIza-test")
+        result = analyze_map(Image.new("RGB", (100, 100)), "AQ.test-key", provider="google")
+    ctor.assert_called_once_with(api_key="AQ.test-key")
     kwargs = client.models.generate_content.call_args.kwargs
     assert kwargs["model"] == ai_analyzer.PROVIDERS["google"].default_model
     assert kwargs["config"].response_mime_type == "application/json"
@@ -227,3 +227,16 @@ def test_thermal_erosion_conserves_mass_and_reduces_steepness():
 
 def test_hillshade_png():
     assert hillshade_png(build_heightmap(hill_analysis(), 20, 20)).startswith(b"\x89PNG")
+
+
+def test_google_rate_limit_message_shows_free_tier_hint():
+    from google.genai import errors
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = errors.ClientError(
+        429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                        "message": "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0"}})
+    with _patch("google", client):
+        with pytest.raises(ProviderError) as info:
+            analyze_map(Image.new("RGB", (10, 10)), "AQ.key", provider="google")
+    assert info.value.kind == "rate_limit"
+    assert "무료 등급" in str(info.value) and "limit: 0" in str(info.value)
