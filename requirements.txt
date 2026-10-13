@@ -1,0 +1,7 @@
+anthropic>=1.13
+streamlit>=1.40
+plotly>=5.24
+scipy>=1.13
+numpy>=2.0
+matplotlib>=3.9
+pillow>=10.0
